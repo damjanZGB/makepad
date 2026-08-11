@@ -31,7 +31,7 @@ use {
         //permission::{PermissionResult, PermissionStatus},
         thread::SignalToUI,
         window::{CxWindowPool, WindowId},
-        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext},
     },
     std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant},
 };
@@ -45,6 +45,7 @@ impl Cx {
 
         // hack: store ID3D11Device in CxOs, so texture-related operations become possible on the makepad/studio side, yet don't completely destroy the code there
         cx.borrow_mut().os.d3d11_device = Some(d3d11_cx.borrow().device.clone());
+        cx.borrow_mut().os.d3d11_context = Some(d3d11_cx.borrow().context.clone());
 
         cx.borrow_mut().set_physical_keyboard_state(true);
         if crate::app_main::should_run_stdin_loop_from_env() {
@@ -933,6 +934,10 @@ pub struct CxOs {
     pub(crate) start_time: Option<Instant>,
     pub(crate) media: CxWindowsMedia,
     pub(crate) d3d11_device: Option<ID3D11Device>,
+    // Stored alongside the device for the same reason: texture work initiated outside the
+    // render loop (a copy into a shared texture, say) needs a context, and the D3d11Cx that
+    // owns one is only borrowed while the event loop is running.
+    pub(crate) d3d11_context: Option<ID3D11DeviceContext>,
     pub(crate) game_input_events: GameInputEventChannel,
     pub(crate) windows_game_input: Option<WindowsGameInput>,
     pub(crate) video_players: HashMap<LiveId, WindowsUnifiedVideoPlayer>,

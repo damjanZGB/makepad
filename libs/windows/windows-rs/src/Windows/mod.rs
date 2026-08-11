@@ -25719,6 +25719,13 @@ impl ID3D11DeviceContext {
     {
         unsafe { (windows_core::Interface::vtable(self).ClearDepthStencilView)(windows_core::Interface::as_raw(self), pdepthstencilview.param().abi(), clearflags, depth, stencil) }
     }
+    pub unsafe fn CopyResource<P0, P1>(&self, pdstresource: P0, psrcresource: P1)
+    where
+        P0: windows_core::Param<ID3D11Resource>,
+        P1: windows_core::Param<ID3D11Resource>,
+    {
+        unsafe { (windows_core::Interface::vtable(self).CopyResource)(windows_core::Interface::as_raw(self), pdstresource.param().abi(), psrcresource.param().abi()) }
+    }
     }
 #[repr(C)]
 #[doc(hidden)]

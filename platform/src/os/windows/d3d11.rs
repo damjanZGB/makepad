@@ -800,6 +800,60 @@ impl Cx {
         cxtexture.os.shared_handle.0 as u64
     }
 
+    /// Copy a finished frame into a shared texture, so another process never reads the
+    /// surface we are still drawing into.
+    ///
+    /// Rendering a pass *directly* into a shared texture is possible (see
+    /// `update_shared_texture`, which creates the render-target view for it) but it is not
+    /// safe to show: a pass begins by clearing its colour target, and a reader on a
+    /// different device — with no shared fence or keyed mutex to order against — samples
+    /// whatever is there at the time, including the cleared-but-not-yet-redrawn state. The
+    /// symptom is a consumer that blinks while the content animates, and does not blink
+    /// while it is static, because an unchanged view never re-enters its pass. The
+    /// producer's own window never shows it, since its blit is ordered on this device.
+    ///
+    /// Copying sidesteps that without any cross-process synchronisation. The destination
+    /// always holds a complete frame; the worst a badly-timed read can see is a mix of two
+    /// complete frames, never a blank one. This is the same shape OBS's own game capture
+    /// uses.
+    ///
+    /// `src` and `dst` must have identical dimensions and pixel format. Returns false if
+    /// either has not been allocated yet — normal on the first frame, before the source
+    /// view has rendered once.
+    pub fn copy_texture_to_shared(&mut self, src: TextureId, dst: &Texture) -> bool {
+        let Some(device) = self.os.d3d11_device.clone() else {
+            return false;
+        };
+
+        // Allocates on first call, and creates the handle the consumer opens. Idempotent
+        // afterwards: alloc_shared only re-creates when the format's size changes.
+        self.textures[dst.texture_id()].update_shared_texture(&device);
+
+        // Clone both COM pointers before touching the pool twice — CxTexture borrows are
+        // exclusive, and a copy needs source and destination live at once.
+        let Some(src_tex) = self.textures[src].os.texture.clone() else {
+            return false;
+        };
+        let Some(dst_tex) = self.textures[dst.texture_id()].os.texture.clone() else {
+            return false;
+        };
+
+        let src_res: ID3D11Resource = match src_tex.cast() {
+            Ok(res) => res,
+            Err(_) => return false,
+        };
+        let dst_res: ID3D11Resource = match dst_tex.cast() {
+            Ok(res) => res,
+            Err(_) => return false,
+        };
+
+        let Some(context) = self.os.d3d11_context.clone() else {
+            return false;
+        };
+        unsafe { context.CopyResource(&dst_res, &src_res) };
+        true
+    }
+
     // HLSL shaders compile synchronously via `hlsl_compile_shaders`, so a shader
     // is "window-ready" iff its OS-level shader entry has been allocated.
     // Used by the shared SLUG helper path that also runs on Linux (where GL may
