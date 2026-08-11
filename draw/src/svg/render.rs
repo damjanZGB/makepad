@@ -607,6 +607,12 @@ fn emit_shape(
             build_path(dv);
             let fill_alpha = style.fill_opacity * opacity;
             set_paint(dv, paint, defs, fill_alpha, xf, bbox, grad_map);
+            // The document's own `fill-rule`, instead of the tessellator guessing
+            // from contour winding. SVG defaults this to nonzero while the guess
+            // defaults to even-odd, so without it a self-intersecting outline --
+            // a pentagram, which is how a compact five-pointed star is drawn and
+            // what `TUR.svg` uses -- fills hollow where a browser fills it solid.
+            dv.cur_fill_rule = Some(style.fill_rule);
             // Use pre-computed fringe (not GPU-expand) to avoid coincident-vertex
             // triangles that cause Metal GPU rasterization artifacts.
             dv.fill();

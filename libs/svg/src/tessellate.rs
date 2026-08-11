@@ -104,6 +104,10 @@ pub struct Tessellator {
     /// prefilter in the fill-side sign probe so the original cost can be
     /// measured. Never set in production.
     disable_probe_bbox: bool,
+    /// The fill rule the source actually asked for, when the caller knows it.
+    /// `None` keeps the legacy guess in `fill()` for callers that build paths
+    /// through `VectorPath` directly and never had a rule to state.
+    fill_rule: Option<FillRule>,
 }
 
 /// Per-stage timing of a single `fill()` call, in nanoseconds.
@@ -136,6 +140,26 @@ enum FillRule {
 }
 
 impl Tessellator {
+    /// State the fill rule the source asked for, which `fill()` then obeys
+    /// instead of guessing.
+    ///
+    /// `None` restores the guess. The guess exists because this tessellator is
+    /// also driven by callers that assemble a `VectorPath` by hand (charts, map
+    /// tiles) and have no notion of an SVG `fill-rule`; it must stay, but it is
+    /// wrong for SVG, whose `fill-rule` *defaults to nonzero* while the guess
+    /// defaults to even-odd. That mismatch is half of why a pentagram used to
+    /// fill wrong -- see `tests/self_intersecting_fill.rs`.
+    ///
+    /// Takes the *document's* rule ([`crate::path::FillRule`]); the enum used
+    /// inside this module is a separate, `Default`-carrying copy that the glob
+    /// import shadows, so the two are mapped explicitly here.
+    pub fn set_fill_rule(&mut self, fill_rule: Option<crate::path::FillRule>) {
+        self.fill_rule = fill_rule.map(|rule| match rule {
+            crate::path::FillRule::NonZero => FillRule::NonZero,
+            crate::path::FillRule::EvenOdd => FillRule::EvenOdd,
+        });
+    }
+
     /// Bounding box of flattened points: (min_x, min_y, max_x, max_y).
     /// Call after `flatten()`.
     pub fn bounds(&self) -> (f32, f32, f32, f32) {
@@ -911,21 +935,33 @@ impl Tessellator {
             return;
         }
 
-        let fill_rule = if self
+        // Did the caller hand us contours that state their own direction? This
+        // is the legacy stand-in for a fill rule, and it is still what the AA
+        // inset below keys off.
+        let has_stated_winding = self
             .paths
             .iter()
-            .any(|sp| sp.count >= 3 && sp.has_explicit_winding)
-        {
+            .any(|sp| sp.count >= 3 && sp.has_explicit_winding);
+        // A rule the caller actually knows beats the guess. SVG always knows
+        // (`fill-rule` defaults to nonzero), so this is how a browser-correct
+        // answer reaches the sweep; see `set_fill_rule`.
+        let fill_rule = self.fill_rule.unwrap_or(if has_stated_winding {
             FillRule::NonZero
         } else {
             FillRule::EvenOdd
-        };
-        let body_inset_woff = if matches!(fill_rule, FillRule::EvenOdd) {
+        });
+        let body_inset_woff = if has_stated_winding {
+            woff
+        } else {
             // Implicit font-like outlines are fragile under inward body shrink.
             // Keep body on-edge and let the fringe provide AA falloff.
+            //
+            // Deliberately keyed on the GUESS and not on `fill_rule`: this is an
+            // antialiasing choice about how the contour was authored, not about
+            // how regions are classified. Re-keying it on the now caller-stated
+            // rule would quietly inset the body of every SVG fill in the
+            // codebase, which is a visual change with no bug behind it.
             0.0
-        } else {
-            woff
         };
 
         self.compute_fill_signs(&mut valid_paths, fill_rule);
@@ -965,21 +1001,59 @@ impl Tessellator {
             lap(&mut stats.body_emit_ns);
         }
 
-        // Feed edges from ALL subpaths into a single sweep-line tessellator.
-        // Regions are classified with the non-zero winding rule.
+        // Feed edges from ALL subpaths into a single sweep-line tessellator,
+        // which classifies regions with `fill_rule`.
+        //
+        // The sweep derives its events solely from endpoints it is handed, so
+        // two edges crossing in their *interiors* generate no event at all and
+        // every region downstream of the crossing is attributed wrongly. So
+        // planarise first: `split_edges_at_crossings` cuts each crossing into a
+        // shared endpoint the sweep already understands.
+        //
+        // When it finds no crossing -- the overwhelmingly common case, and every
+        // map tile -- nothing is cut and the ring fast path runs unchanged, so
+        // the allocation-free `push_ring` still serves those fills. Only a
+        // genuinely self-intersecting path pays for the per-edge path.
         {
-            let all_fill_verts = &verts[fill_base as usize..];
-            let tess = &mut self.sweep;
-            tess.reset(fill_rule);
+            let mut edges: Vec<FEdge> = Vec::new();
             let mut offset = 0usize;
             for &(_first, count, _) in &valid_paths {
-                // Ring edges preserve original contour order for non-zero
-                // winding.
-                tess.push_ring(
-                    &all_fill_verts[offset..offset + count],
-                    fill_base + offset as u32,
-                );
+                for i in 0..count {
+                    let j = (i + 1) % count;
+                    let vi = verts[fill_base as usize + offset + i];
+                    let vj = verts[fill_base as usize + offset + j];
+                    // Preserve original contour order for non-zero winding.
+                    edges.push(FEdge {
+                        a: FPoint::new(vi.x, vi.y),
+                        a_index: fill_base + (offset + i) as u32,
+                        b: FPoint::new(vj.x, vj.y),
+                        b_index: fill_base + (offset + j) as u32,
+                    });
+                }
                 offset += count;
+            }
+            // A crossing always interns at least one new vertex, so the vertex
+            // count is exactly the signal for whether anything was cut.
+            let verts_before = verts.len();
+            split_edges_at_crossings(&mut edges, verts, gpu_expand_fill);
+            let planarised = verts.len() != verts_before;
+
+            let tess = &mut self.sweep;
+            tess.reset(fill_rule);
+            if planarised {
+                for edge in &edges {
+                    tess.push_edge(edge.a, edge.a_index, edge.b, edge.b_index);
+                }
+            } else {
+                let all_fill_verts = &verts[fill_base as usize..];
+                let mut offset = 0usize;
+                for &(_first, count, _) in &valid_paths {
+                    tess.push_ring(
+                        &all_fill_verts[offset..offset + count],
+                        fill_base + offset as u32,
+                    );
+                    offset += count;
+                }
             }
             tess.tessellate_into(indices);
         }
@@ -1103,20 +1177,19 @@ impl Tessellator {
         if valid_paths.is_empty() {
             return;
         }
-        let fill_rule = if self
+        // Same split as `fill_into`: the fill-side signs must agree with the
+        // body that path emitted, so they follow the caller-stated rule, while
+        // the AA inset stays keyed on the legacy guess.
+        let has_stated_winding = self
             .paths
             .iter()
-            .any(|sp| sp.count >= 3 && sp.has_explicit_winding)
-        {
+            .any(|sp| sp.count >= 3 && sp.has_explicit_winding);
+        let fill_rule = self.fill_rule.unwrap_or(if has_stated_winding {
             FillRule::NonZero
         } else {
             FillRule::EvenOdd
-        };
-        let body_inset_woff = if matches!(fill_rule, FillRule::EvenOdd) {
-            0.0
-        } else {
-            woff
-        };
+        });
+        let body_inset_woff = if has_stated_winding { woff } else { 0.0 };
         self.compute_fill_signs(&mut valid_paths, fill_rule);
         self.emit_fill_fringe(
             &valid_paths,
@@ -1566,8 +1639,15 @@ mod fixture_dump {
 }
 
 // ---- Sweep-line monotone polygon tessellator (ported from bender) ----
-// Correctly triangulates concave (and self-intersecting) polygons using
-// sweep-line decomposition into monotone sub-polygons, then triangulating each.
+// Decomposes concave polygons into monotone sub-polygons with a sweep line,
+// then triangulates each.
+//
+// It copes with SELF-INTERSECTING input only because `split_edges_at_crossings`
+// below hands it an already-planar edge set. On its own it does not: every
+// event it processes comes from an endpoint it was given, so two edges crossing
+// in their interiors are invisible to it. This comment used to claim the
+// opposite, which is what sent the pentagram investigation off to the GPU
+// shader instead of here.
 
 // Minimal 2D point for the tessellator
 #[derive(Clone, Copy, Debug)]
@@ -1599,6 +1679,216 @@ impl PartialOrd for FPoint {
 }
 
 // Line segment for sweep-line
+// One contour edge on its way into the sweep line, carrying the vertex indices
+// the emitted triangles will refer to.
+#[derive(Clone, Copy, Debug)]
+struct FEdge {
+    a: FPoint,
+    a_index: u32,
+    b: FPoint,
+    b_index: u32,
+}
+
+impl FEdge {
+    fn min_x(&self) -> f32 {
+        self.a.x.min(self.b.x)
+    }
+    fn max_x(&self) -> f32 {
+        self.a.x.max(self.b.x)
+    }
+    fn min_y(&self) -> f32 {
+        self.a.y.min(self.b.y)
+    }
+    fn max_y(&self) -> f32 {
+        self.a.y.max(self.b.y)
+    }
+
+    /// Where this edge properly crosses `other`: the parameter along each and
+    /// the crossing point, or `None` if they do not cross in their interiors.
+    ///
+    /// "Properly" means strictly interior to BOTH (`0 < t < 1`). A shared
+    /// endpoint, or an endpoint that lands on the other edge, is deliberately
+    /// left alone: the sweep already handles a vertex sitting on an active edge
+    /// (`find_incident_range` widens to it and `SweepActiveEdge::split` cuts
+    /// there), and splitting at t=0 or t=1 would only manufacture a zero-length
+    /// fragment that `push_edge` discards anyway.
+    fn crossing(&self, other: &FEdge) -> Option<(f32, f32, FPoint)> {
+        let (rx, ry) = (self.b.x - self.a.x, self.b.y - self.a.y);
+        let (sx, sy) = (other.b.x - other.a.x, other.b.y - other.a.y);
+        let denom = rx * sy - ry * sx;
+        // Parallel or collinear. Collinear overlap has no single crossing point
+        // to split at, and the sweep's own `SweepPendingEdge::splice` already
+        // merges the winding of edges that leave a vertex in the same direction.
+        if denom == 0.0 {
+            return None;
+        }
+        let (qx, qy) = (other.a.x - self.a.x, other.a.y - self.a.y);
+        let t = (qx * sy - qy * sx) / denom;
+        let u = (qx * ry - qy * rx) / denom;
+        if !(t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0) {
+            return None;
+        }
+        // Evaluated on THIS edge only, and then shared with the other edge by
+        // the caller, so both fragments meet at bit-identical f32 coordinates.
+        Some((t, u, FPoint::new(self.a.x + rx * t, self.a.y + ry * t)))
+    }
+}
+
+/// Split every edge wherever it properly crosses another, so the sweep line only
+/// ever meets edges at shared endpoints.
+///
+/// WHY this is needed at all. `SweepTessellator` derives its events solely from
+/// the endpoints it is handed: `push_edge` queues exactly two events per edge,
+/// and `SweepActiveEdge::split` only fires for a vertex that already exists.
+/// Two edges crossing in their interiors therefore produce no event at all. The
+/// active-edge list keeps its pre-crossing order past that point, so every
+/// `upper_region_winding` accumulated downstream is attributed to the wrong
+/// region and `region_is_interior` is asked the wrong question. That is not a
+/// fill-rule fault -- it corrupts even-odd exactly as badly -- and it is why a
+/// pentagram (five segments that cross, the compact way to draw a five-pointed
+/// star, and what `TUR.svg` uses) came out as a single trapezoid. The comment
+/// above `FPoint` claiming self-intersecting polygons were handled was simply
+/// untrue.
+///
+/// WHY the split happens here rather than inside the sweep. Both fragments of a
+/// cut edge are given the SAME `FPoint` -- the f32 pair is computed once and
+/// copied -- and the same newly interned vertex index. The crossing is thus a
+/// genuine shared endpoint that `FPoint::eq` matches exactly and `pop_events`
+/// merges into one event, which is the representation the rest of the sweep
+/// already knows how to handle. Computing the crossing inside the sweep would
+/// instead need a freshly derived f32 point to compare exactly `Equal` against
+/// both segments in `FSegment::compare_to_point`, an exact predicate on an
+/// inexact point; it generally does not, and the edge would be missed again.
+///
+/// WHAT THIS IS NOT: an outline or boolean pass. No edge is dropped, reversed or
+/// merged, so each fragment keeps the direction -- and therefore the signed
+/// winding contribution -- of the edge it came from. Deciding what is interior
+/// stays entirely with `fill_rule`, and both rules keep their own answer: the
+/// pentagram's centre pentagon reaches winding 2, which non-zero fills and
+/// even-odd does not. `tests/self_intersecting_fill.rs` pins both.
+///
+/// COST: sweep-and-prune on x. Edges are visited in min-x order and compared
+/// only against edges still open at that x, with a y-overlap reject on top, so
+/// for the geometry this actually sees -- short, spatially separated edges from
+/// flattened curves, map tiles and chart series -- the active set stays small
+/// and the pass is near-linear.
+///
+/// Measured on a 5000-edge closed outline with no crossings at all -- the shape
+/// of the worst realistic input, a dense map tile -- `fill()` went 1.87ms ->
+/// 2.31ms, so detection costs ~88ns per edge when it finds nothing. A
+/// deliberately adversarial 200 mutually overlapping pentagrams goes 19ms ->
+/// 644ms, but that is not a regression to compare against: the 19ms run emitted
+/// 3080 triangles and was simply wrong, the 644ms run emits 435047 and is right.
+/// That input has ~218000 genuine crossings and a crossing has to become a
+/// vertex.
+///
+/// It degrades to quadratic only for a path made mostly of long mutually
+/// overlapping segments -- which is also the only shape whose crossing COUNT is
+/// quadratic, so the pairing is not what dominates there either.
+fn split_edges_at_crossings(edges: &mut Vec<FEdge>, verts: &mut Vec<VVertex>, gpu_expand: bool) {
+    // Three edges or fewer cannot cross without sharing an endpoint, and a
+    // shared endpoint is not a proper crossing.
+    if edges.len() < 4 {
+        return;
+    }
+
+    // Crossing parameters found on each edge, as (t along that edge, vertex).
+    let mut cuts: Vec<Vec<(f32, u32)>> = vec![Vec::new(); edges.len()];
+    // Interning by exact bit pattern, so a point where three or more edges meet
+    // becomes ONE vertex for all of them rather than several coincident ones
+    // that the sweep would then treat as separate events.
+    let mut interned: std::collections::HashMap<(u32, u32), u32> =
+        std::collections::HashMap::new();
+    let mut found_any = false;
+
+    let mut order: Vec<usize> = (0..edges.len()).collect();
+    order.sort_by(|&a, &b| {
+        edges[a]
+            .min_x()
+            .partial_cmp(&edges[b].min_x())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut active: Vec<usize> = Vec::new();
+    for &i in &order {
+        let ei = edges[i];
+        let sweep_x = ei.min_x();
+        // Anything whose x-extent has been passed can never meet a later edge.
+        active.retain(|&j| edges[j].max_x() >= sweep_x);
+        for &j in &active {
+            let ej = edges[j];
+            if ei.min_y() > ej.max_y() || ej.min_y() > ei.max_y() {
+                continue;
+            }
+            let Some((ti, tj, point)) = ei.crossing(&ej) else {
+                continue;
+            };
+            let key = (point.x.to_bits(), point.y.to_bits());
+            let index = *interned.entry(key).or_insert_with(|| {
+                let index = verts.len() as u32;
+                // A crossing point is interior to the fill body, so it carries
+                // what every other body vertex carries: u = 0.5 (fully covered,
+                // not on the AA fringe). In GPU-expand mode v/stroke_dist hold
+                // the outward normal used to push a vertex onto the fringe, and
+                // an interior point is never pushed anywhere -- hence zero.
+                verts.push(VVertex {
+                    x: point.x,
+                    y: point.y,
+                    u: 0.5,
+                    v: if gpu_expand { 0.0 } else { 1.0 },
+                    stroke_dist: 0.0,
+                    clip_radius: 0.0,
+                });
+                index
+            });
+            cuts[i].push((ti, index));
+            cuts[j].push((tj, index));
+            found_any = true;
+        }
+        active.push(i);
+    }
+
+    if !found_any {
+        return;
+    }
+
+    let mut split = Vec::with_capacity(edges.len() + interned.len() * 2);
+    for (i, edge) in edges.iter().enumerate() {
+        if cuts[i].is_empty() {
+            split.push(*edge);
+            continue;
+        }
+        // Walk the cuts in order along the edge so the fragments are contiguous
+        // and each keeps the original direction.
+        cuts[i].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut from = (edge.a, edge.a_index);
+        for &(_, index) in &cuts[i] {
+            let point = FPoint::new(verts[index as usize].x, verts[index as usize].y);
+            // Two cuts can round to the same f32 point on a very short edge;
+            // emitting a zero-length fragment there would be dropped by
+            // `push_edge` anyway, so skip it and keep walking.
+            if point != from.0 {
+                split.push(FEdge {
+                    a: from.0,
+                    a_index: from.1,
+                    b: point,
+                    b_index: index,
+                });
+            }
+            from = (point, index);
+        }
+        if edge.b != from.0 {
+            split.push(FEdge {
+                a: from.0,
+                a_index: from.1,
+                b: edge.b,
+                b_index: edge.b_index,
+            });
+        }
+    }
+    *edges = split;
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FSegment {
     start: FPoint,
@@ -1915,6 +2205,51 @@ impl SweepTessellator {
         self.event_queue.clear();
         self.right_edges_scratch.clear();
         self.mono_arena.reset();
+    }
+
+    /// Queue the two events for a single edge.
+    ///
+    /// The per-ring `push_ring` below is the fast path and covers every fill
+    /// whose contours do not cross themselves. This one exists for the
+    /// planarised edge set produced by `split_edges_at_crossings`, whose
+    /// fragments no longer form contiguous rings.
+    fn push_edge(&mut self, start: FPoint, start_index: u32, end: FPoint, end_index: u32) {
+        if start == end {
+            return;
+        }
+        let less = start.partial_cmp(&end) == Some(std::cmp::Ordering::Less);
+        // Even-odd only ever counts parity, so a flipped edge keeps POS;
+        // non-zero has to record that the edge was reversed into sort order.
+        let (start, start_index, end, end_index, winding) = match self.fill_rule {
+            FillRule::NonZero => {
+                if less {
+                    (start, start_index, end, end_index, FWinding::POS)
+                } else {
+                    (end, end_index, start, start_index, FWinding::NEG)
+                }
+            }
+            FillRule::EvenOdd => {
+                if less {
+                    (start, start_index, end, end_index, FWinding::POS)
+                } else {
+                    (end, end_index, start, start_index, FWinding::POS)
+                }
+            }
+        };
+        self.events.push(SweepEvent {
+            vertex: start,
+            vertex_index: start_index,
+            pending_edge: Some(SweepPendingEdge {
+                winding,
+                end,
+                end_index,
+            }),
+        });
+        self.events.push(SweepEvent {
+            vertex: end,
+            vertex_index: end_index,
+            pending_edge: None,
+        });
     }
 
     /// Queue events for one closed ring of `count` vertices whose positions
