@@ -474,7 +474,20 @@ impl Cx {
             for color_texture in self.passes[pass_id].color_textures.iter() {
                 let cxtexture = &mut self.textures[color_texture.texture.texture_id()];
                 let size = pass_rect.size * dpi_factor;
-                cxtexture.update_render_target(d3d11_cx, size.x as usize, size.y as usize);
+                if cxtexture.format.is_shared() {
+                    // A shared texture is allocated by `update_shared_texture`, which
+                    // creates both views, and carries its own fixed width/height in the
+                    // format rather than taking the pass rect's. `update_render_target`
+                    // would decline it (`as_render_alloc` matches only Render* formats)
+                    // and leave `render_target_view` None for the unwrap below.
+                    //
+                    // This is what lets a process render an overlay into a texture
+                    // another process opens by handle: previously only the receiving
+                    // side of a shared texture could render into one.
+                    cxtexture.update_shared_texture(&d3d11_cx.device);
+                } else {
+                    cxtexture.update_render_target(d3d11_cx, size.x as usize, size.y as usize);
+                }
                 let is_initial = cxtexture.take_initial();
                 let render_target = if let Some(cube_face) = color_texture.cube_face {
                     cxtexture.os.render_target_face_views[cube_face as usize].clone()
@@ -1798,6 +1811,28 @@ impl CxTexture {
                     .unwrap()
             };
 
+            // A render-target view as well, so a DrawPass can target the texture we
+            // just created and not only sample it.
+            //
+            // Without this, creating and *opening* a shared texture were asymmetric:
+            // `update_from_shared_handle` below builds both views, so a texture
+            // adopted from another process could be rendered into, while one created
+            // here could not. The BindFlags above already ask for
+            // D3D11_BIND_RENDER_TARGET, so the capability was allocated and then left
+            // unused.
+            //
+            // The asymmetry failed loudly but unhelpfully: a pass whose colour target
+            // is a shared texture reaches the `color_textures` loop in
+            // `setup_pass_render_targets`, where `alloc_render` declines the Shared
+            // category and leaves `render_target_view` as None — which is then
+            // `.unwrap()`ed. The panic names neither the texture nor the format.
+            let mut render_target_view = None;
+            unsafe {
+                d3d11_device
+                    .CreateRenderTargetView(&resource, None, Some(&mut render_target_view))
+                    .unwrap()
+            };
+
             // get IDXGIResource interface on newly created texture object
             let dxgi_resource: IDXGIResource = resource.cast().unwrap();
             //let mut dxgi_resource_ptr = None;
@@ -1810,6 +1845,7 @@ impl CxTexture {
 
             self.os.texture = texture;
             self.os.shader_resource_view = shader_resource_view;
+            self.os.render_target_view = render_target_view;
             self.os.shared_handle = handle;
         }
     }

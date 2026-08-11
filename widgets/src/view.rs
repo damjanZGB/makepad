@@ -147,6 +147,14 @@ pub struct View {
 
     #[rust]
     texture_cache: Option<ViewTextureCache>,
+    // A caller-supplied render target for Texture mode, in place of the internally
+    // allocated one. Lets the composited result be read from outside this process —
+    // a shared texture handed to another application, for instance.
+    //
+    // Not a live/DSL field: a Texture is a runtime handle, and which texture a view
+    // renders into is a wiring decision rather than a styling one.
+    #[rust]
+    cache_texture: Option<Texture>,
     #[rust]
     defer_walks: SmallVec<[(LiveId, DeferredWalk); 1]>,
     #[rust]
@@ -481,6 +489,15 @@ impl ViewRef {
             inner.area
         } else {
             Area::Empty
+        }
+    }
+
+    /// See [`View::set_cache_texture`]. Silently does nothing if the ref is empty,
+    /// like every other setter here — check [`Self::cached_texture_id`] afterwards if
+    /// the wiring needs confirming.
+    pub fn set_cache_texture(&self, texture: Option<Texture>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_cache_texture(texture);
         }
     }
 
@@ -937,13 +954,24 @@ impl Widget for View {
                         });
                         let texture_cache = self.texture_cache.as_mut().unwrap();
                         //cache.pass.set_depth_texture(cx, &cache.depth_texture, PassClearDepth::ClearWith(1.0));
-                        texture_cache.color_texture = Texture::new_with_format(
-                            cx,
-                            TextureFormat::RenderBGRAu8 {
-                                size: TextureSize::Auto,
-                                initial: true,
-                            },
-                        );
+                        // A caller-supplied texture wins, so a view's composited output
+                        // can be rendered somewhere the caller can also reach — a
+                        // shared texture another process opens by handle, say. The
+                        // default stays an internally sized RenderBGRAu8.
+                        //
+                        // The supplied texture owns its size (a shared format carries
+                        // explicit width/height), which is why TextureSize::Auto is not
+                        // imposed on it.
+                        texture_cache.color_texture = match &self.cache_texture {
+                            Some(texture) => texture.clone(),
+                            None => Texture::new_with_format(
+                                cx,
+                                TextureFormat::RenderBGRAu8 {
+                                    size: TextureSize::Auto,
+                                    initial: true,
+                                },
+                            ),
+                        };
                         texture_cache.pass.set_color_texture(
                             cx,
                             &texture_cache.color_texture,
@@ -1166,6 +1194,29 @@ impl View {
     pub fn redraw_texture_cache(&mut self) {
         self.force_texture_redraw = true;
         self.view_size = None;
+    }
+
+    /// Renders this view's Texture-mode cache into `texture` instead of an internally
+    /// allocated one, so the composited result can be read by the caller — including
+    /// from another process, when the texture is a shared one.
+    ///
+    /// `None` restores the default. The supplied texture must be usable as a pass
+    /// colour target; its format decides its size, so a fixed-size format pins the
+    /// cache to that resolution regardless of the view's walk. Has no effect unless
+    /// the view is in [`ViewOptimize::Texture`] mode.
+    pub fn set_cache_texture(&mut self, texture: Option<Texture>) {
+        let current = self.cache_texture.as_ref().map(|t| t.texture_id());
+        let next = texture.as_ref().map(|t| t.texture_id());
+        if current == next {
+            return;
+        }
+        self.cache_texture = texture;
+        // Drop the pass so the next draw rebuilds it against the new target. The
+        // forced redraw matters as much: the on-screen rect has not moved, so
+        // `will_redraw` would cache-hit and keep compositing the *old* texture while
+        // the new one stayed black.
+        self.texture_cache = None;
+        self.redraw_texture_cache();
     }
 
     /// Caps the offscreen texture's height when this view is in Texture mode. `None` (the default)
