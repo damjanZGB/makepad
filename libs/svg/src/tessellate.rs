@@ -1355,34 +1355,124 @@ impl FEdge {
         self.a.y.max(self.b.y)
     }
 
-    /// Where this edge properly crosses `other`: the parameter along each and
-    /// the crossing point, or `None` if they do not cross in their interiors.
+    fn is_degenerate(&self) -> bool {
+        self.a == self.b
+    }
+
+    /// How far along this edge `p` lies, for a point already known to be
+    /// collinear with it. Measured on the edge's DOMINANT axis, whose span is
+    /// guaranteed non-zero for a non-degenerate edge -- the other axis can be
+    /// exactly zero (a horizontal or vertical edge) and would divide by it.
     ///
-    /// "Properly" means strictly interior to BOTH (`0 < t < 1`). A shared
-    /// endpoint, or an endpoint that lands on the other edge, is deliberately
-    /// left alone: the sweep already handles a vertex sitting on an active edge
-    /// (`find_incident_range` widens to it and `SweepActiveEdge::split` cuts
-    /// there), and splitting at t=0 or t=1 would only manufacture a zero-length
-    /// fragment that `push_edge` discards anyway.
-    fn crossing(&self, other: &FEdge) -> Option<(f32, f32, FPoint)> {
+    /// Only ever used to order cuts along an edge, so the absolute value does
+    /// not have to be accurate, just monotonic.
+    fn param_of(&self, p: FPoint) -> f32 {
+        let (dx, dy) = (self.b.x - self.a.x, self.b.y - self.a.y);
+        if dx.abs() >= dy.abs() {
+            (p.x - self.a.x) / dx
+        } else {
+            (p.y - self.a.y) / dy
+        }
+    }
+
+    /// True when `p` -- already known to be collinear with this edge -- lies
+    /// strictly between its endpoints, so cutting here yields two real
+    /// fragments.
+    ///
+    /// The exact `p == a || p == b` rejection is what keeps ADJACENT edges of a
+    /// contour, and two contours that merely touch at a shared vertex, from
+    /// generating cuts: they meet exactly at an endpoint, which is already the
+    /// shared endpoint the sweep wants, so there is nothing to split.
+    ///
+    /// Containment is tested on the dominant axis alone. A bounding-box test
+    /// would be wrong for a vertical edge, whose x-extent is a single value that
+    /// a collinear-to-within-rounding point can miss by an ulp.
+    fn spans_collinear_point(&self, p: FPoint) -> bool {
+        if p == self.a || p == self.b {
+            return false;
+        }
+        let (dx, dy) = (self.b.x - self.a.x, self.b.y - self.a.y);
+        if dx.abs() >= dy.abs() {
+            p.x > self.a.x.min(self.b.x) && p.x < self.a.x.max(self.b.x)
+        } else {
+            p.y > self.a.y.min(self.b.y) && p.y < self.a.y.max(self.b.y)
+        }
+    }
+
+    /// The point where this edge's line meets `other`'s, as parameters along
+    /// each plus the point itself. Only meaningful once `orient` has confirmed
+    /// the two genuinely straddle each other, which also bounds `denom` away
+    /// from zero.
+    fn crossing_point(&self, other: &FEdge) -> Option<(f32, f32, FPoint)> {
         let (rx, ry) = (self.b.x - self.a.x, self.b.y - self.a.y);
         let (sx, sy) = (other.b.x - other.a.x, other.b.y - other.a.y);
         let denom = rx * sy - ry * sx;
-        // Parallel or collinear. Collinear overlap has no single crossing point
-        // to split at, and the sweep's own `SweepPendingEdge::splice` already
-        // merges the winding of edges that leave a vertex in the same direction.
         if denom == 0.0 {
             return None;
         }
         let (qx, qy) = (other.a.x - self.a.x, other.a.y - self.a.y);
         let t = (qx * sy - qy * sx) / denom;
         let u = (qx * ry - qy * rx) / denom;
-        if !(t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0) {
-            return None;
-        }
         // Evaluated on THIS edge only, and then shared with the other edge by
         // the caller, so both fragments meet at bit-identical f32 coordinates.
         Some((t, u, FPoint::new(self.a.x + rx * t, self.a.y + ry * t)))
+    }
+}
+
+/// Which side of the directed line `a -> b` the point `p` falls on: `1` left,
+/// `-1` right, `0` collinear.
+///
+/// WHY THIS IS NOT A BARE SIGN TEST. The whole planarisation rests on agreeing
+/// with itself about whether a point is on a line, and the natural expression
+/// `cross(b - a, p - a)` is evaluated in f32 with four subtractions and two
+/// multiplications, every one of them rounded. A point that an SVG author placed
+/// exactly on an edge does not survive the viewBox transform and curve
+/// flattening as an exactly-collinear f32 triple; the computed cross product
+/// comes out as some tiny non-zero value whose SIGN IS NOISE. Testing it against
+/// literal `0.0` therefore decides T-junctions by coin flip -- measured, before
+/// this predicate existed, at 10 of 40 sampled scale/rotation/offset
+/// combinations of one notched chevron mis-filling, five of them across ~3% of
+/// the shape's area, with no pattern to which ones.
+///
+/// So instead of comparing against zero, compare against THE ROUNDING ERROR OF
+/// THIS VERY EXPRESSION. `bound` is Shewchuk's static filter for `orient2d`
+/// (*Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric
+/// Predicates*, 1997, §4.3): the error in the computed determinant is at most
+/// `(3 + 16u)u` times the sum of the magnitudes of its two product terms, where
+/// `u` is the unit roundoff -- `2^-24` for f32, which is `f32::EPSILON / 2`.
+/// That makes the strict bound `1.5 * f32::EPSILON * (|left| + |right|)`.
+///
+/// This uses `4.0`, ~2.7x the strict bound, deliberately:
+///
+///   * The filter is only sound for inputs that are exact f32 values. Ours are
+///     not -- they arrive through a viewBox transform, an affine node
+///     transform, and Bezier flattening, so they already carry several rounding
+///     steps of accumulated error before this predicate sees them. The margin
+///     covers that history.
+///   * The two outcomes are not symmetric in cost. Wrongly calling a truly
+///     collinear point "off the line" is the bug this replaces: it silently
+///     skips a T-junction and corrupts every winding region downstream of it.
+///     Wrongly calling a very-nearly-collinear point "on the line" merely snaps
+///     a cut onto an existing vertex that is within ~5e-7 RELATIVE of where it
+///     would otherwise have gone -- far below one device pixel at any scale,
+///     because the bound is relative to the operands and therefore scale-free.
+///     Erring towards collinear is the safe direction, so the margin goes there.
+///
+/// Being relative is what makes this usable at all here: the tessellator runs in
+/// document units, and those range from a 0-1 unit square to `TUR.svg`'s
+/// `0 -30000 90000 60000` viewBox. Any absolute epsilon would be simultaneously
+/// far too coarse for one and far too fine for the other.
+fn orient(a: FPoint, b: FPoint, p: FPoint) -> i32 {
+    let left = (b.x - a.x) * (p.y - a.y);
+    let right = (b.y - a.y) * (p.x - a.x);
+    let det = left - right;
+    let bound = 4.0 * f32::EPSILON * (left.abs() + right.abs());
+    if det > bound {
+        1
+    } else if det < -bound {
+        -1
+    } else {
+        0
     }
 }
 
@@ -1412,6 +1502,29 @@ impl FEdge {
 /// both segments in `FSegment::compare_to_point`, an exact predicate on an
 /// inexact point; it generally does not, and the edge would be missed again.
 ///
+/// THE THREE WAYS TWO EDGES CAN MEET, all handled here and all decided by
+/// `orient` rather than by any comparison against a literal zero:
+///
+///   * A proper crossing, in both interiors. A new vertex is interned at the
+///     intersection and both edges are cut there.
+///   * A T-JUNCTION -- one edge's endpoint lying on the other's interior. The
+///     other edge is cut AT THAT ALREADY-EXISTING VERTEX; nothing new is
+///     interned. This matters because the two then share one index and one
+///     bit-identical `FPoint`, so there is no sliver fragment and no chance of
+///     the sweep seeing two "almost equal" events. Left to the sweep's own
+///     exact predicate this case failed at 10 of 40 sampled scale/rotation/
+///     offset combinations of a single notched chevron; see `orient`.
+///   * A COLLINEAR OVERLAP. Each edge is cut at whichever of the other's
+///     endpoints lies inside it, which reduces the shared stretch to a pair of
+///     exactly-coincident edges with identical endpoints -- the form
+///     `SweepPendingEdge::splice` already merges, summing their windings so an
+///     interior seam between two abutting shapes correctly cancels.
+///
+/// Two edges that merely share an endpoint -- every adjacent pair in a contour,
+/// and two contours touching at a point -- produce nothing, because
+/// `spans_collinear_point` rejects exact endpoint equality. They are already in
+/// the shared-endpoint form the sweep wants.
+///
 /// WHAT THIS IS NOT: an outline or boolean pass. No edge is dropped, reversed or
 /// merged, so each fragment keeps the direction -- and therefore the signed
 /// winding contribution -- of the edge it came from. Deciding what is interior
@@ -1426,13 +1539,23 @@ impl FEdge {
 /// and the pass is near-linear.
 ///
 /// Measured on a 5000-edge closed outline with no crossings at all -- the shape
-/// of the worst realistic input, a dense map tile -- `fill()` went 1.87ms ->
-/// 2.31ms, so detection costs ~88ns per edge when it finds nothing. A
-/// deliberately adversarial 200 mutually overlapping pentagrams goes 19ms ->
-/// 644ms, but that is not a regression to compare against: the 19ms run emitted
-/// 3080 triangles and was simply wrong, the 644ms run emits 435047 and is right.
-/// That input has ~218000 genuine crossings and a crossing has to become a
-/// vertex.
+/// of the worst realistic input, a dense map tile. Min of 40 runs, re-flattening
+/// before each, which matters: `fill()` is NOT idempotent on one `flatten()`, so
+/// timing a loop of repeated `fill()` calls measures progressively degenerate
+/// work and understates the cost by ~2x. An earlier version of this comment
+/// quoted 1.87ms -> 2.31ms from exactly that mistake; the honest figures are
+///
+///   no planarisation at all      1.58ms   (and self-intersections drawn wrong)
+///   crossings only               1.98ms
+///   crossings + T-junctions      1.95ms
+///
+/// so the whole pass costs ~25%, and handling the degenerate meetings on top of
+/// proper crossings is free -- the two early-outs on the orientation signs pay
+/// for the extra predicates. A deliberately adversarial 200 mutually overlapping
+/// pentagrams goes 16ms -> 599ms, but that is not a regression to compare
+/// against: the 16ms run emitted 3080 triangles and was simply wrong, the 599ms
+/// run emits 435047 and is right. That input has ~218000 genuine crossings and a
+/// crossing has to become a vertex.
 ///
 /// It degrades to quadratic only for a path made mostly of long mutually
 /// overlapping segments -- which is also the only shape whose crossing COUNT is
@@ -1464,6 +1587,14 @@ fn split_edges_at_crossings(edges: &mut Vec<FEdge>, verts: &mut Vec<VVertex>, gp
     let mut active: Vec<usize> = Vec::new();
     for &i in &order {
         let ei = edges[i];
+        // A zero-length edge is collinear with everything and spans nothing, so
+        // it can neither be cut nor cut anything. `prepare_points` already
+        // merges points closer than its `dist_tol`, and `push_edge` drops these
+        // outright, but skipping here keeps them out of `orient`, where a null
+        // direction vector would make every test read "collinear".
+        if ei.is_degenerate() {
+            continue;
+        }
         let sweep_x = ei.min_x();
         // Anything whose x-extent has been passed can never meet a later edge.
         active.retain(|&j| edges[j].max_x() >= sweep_x);
@@ -1472,7 +1603,73 @@ fn split_edges_at_crossings(edges: &mut Vec<FEdge>, verts: &mut Vec<VVertex>, gp
             if ei.min_y() > ej.max_y() || ej.min_y() > ei.max_y() {
                 continue;
             }
-            let Some((ti, tj, point)) = ei.crossing(&ej) else {
+
+            // Where each edge's endpoints fall relative to the other's line.
+            // These four signs classify every way two segments can meet, and
+            // they are the ONLY place the decision is made -- no comparison
+            // against a raw zero, and no reliance on the intersection
+            // parameters landing exactly on 0.0 or 1.0.
+            //
+            // Ordered as two early-outs rather than four unconditional tests:
+            // if `ej` lies wholly to one side of `ei`'s line they cannot meet,
+            // which settles the overwhelming majority of candidate pairs for
+            // half the arithmetic. Worth stating because the obvious "compute
+            // all four, then decide" costs twice as much on a dense path --
+            // measured at 4.12ms against 1.95ms per fill on the 5000-edge
+            // benchmark described below.
+            let oja = orient(ei.a, ei.b, ej.a);
+            let ojb = orient(ei.a, ei.b, ej.b);
+            if oja != 0 && oja == ojb {
+                continue;
+            }
+            let oia = orient(ej.a, ej.b, ei.a);
+            let oib = orient(ej.a, ej.b, ei.b);
+            if oia != 0 && oia == oib {
+                continue;
+            }
+
+            // An endpoint lying ON the other edge: cut the other edge AT THAT
+            // EXISTING VERTEX. This is the T-junction case, and reusing the
+            // vertex rather than manufacturing a new one is the whole point --
+            // the two edges then meet at a bit-identical `FPoint` with one
+            // shared index, which is exactly the shared endpoint the sweep is
+            // built to handle. Four independent tests rather than a match,
+            // because a collinear overlap satisfies several at once and each
+            // contributes its own cut.
+            //
+            // Gated on some orientation actually being zero so the common pair
+            // never builds the table.
+            let mut met_at_a_vertex = false;
+            if oja == 0 || ojb == 0 || oia == 0 || oib == 0 {
+                for (host, host_slot, guest, guest_index, guest_orient) in [
+                    (ei, i, ej.a, ej.a_index, oja),
+                    (ei, i, ej.b, ej.b_index, ojb),
+                    (ej, j, ei.a, ei.a_index, oia),
+                    (ej, j, ei.b, ei.b_index, oib),
+                ] {
+                    if guest_orient == 0 && host.spans_collinear_point(guest) {
+                        cuts[host_slot].push((host.param_of(guest), guest_index));
+                        found_any = true;
+                        met_at_a_vertex = true;
+                    }
+                }
+            }
+            // Two straight segments meet in at most one point unless they are
+            // collinear, and a collinear pair is fully described by the cuts
+            // just made. Either way there is no separate crossing left to find.
+            if met_at_a_vertex {
+                continue;
+            }
+
+            // A proper crossing: each edge's endpoints fall on strictly
+            // opposite sides of the other. Because both straddles are strict --
+            // every sign is beyond `orient`'s error bound -- the two lines are
+            // meaningfully non-parallel here, so the division below is well
+            // conditioned rather than merely non-zero.
+            if oja * ojb >= 0 || oia * oib >= 0 {
+                continue;
+            }
+            let Some((ti, tj, point)) = ei.crossing_point(&ej) else {
                 continue;
             };
             let key = (point.x.to_bits(), point.y.to_bits());
