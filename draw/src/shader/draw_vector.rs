@@ -1,4 +1,5 @@
 use crate::{cx_2d::*, draw_list_2d::ManyInstances, makepad_platform::*, turtle::*, vector::*};
+use makepad_svg::path::FillRule;
 use makepad_svg::tessellate::compute_clip_radii;
 
 script_mod! {
@@ -318,6 +319,15 @@ pub struct DrawVector {
     /// Curve flatten tolerance (path-local units); set ~`device_px / device_scale` for constant on-screen smoothness. 0.0 = use 0.25.
     #[rust]
     pub cur_tolerance: f32,
+    /// Fill rule for the next `fill()`, when the caller knows it. `None` leaves
+    /// the tessellator to guess from contour winding, which is right for paths
+    /// assembled by hand (charts, map tiles) and wrong for SVG, whose
+    /// `fill-rule` defaults to nonzero while the guess defaults to even-odd.
+    ///
+    /// Consumed and cleared by `fill_opts_mode`, like `cur_gradient_row_v`, so a
+    /// rule stated for one path cannot leak into an unrelated later fill.
+    #[rust]
+    pub cur_fill_rule: Option<FillRule>,
     // Effect bounding box (world-space): [min_x, min_y, max_x, max_y]
     // When set, stored in param1-param4 for solid-painted shapes with shader_id > 0,
     // enabling the pixel shader to compute proper UV coordinates from v_world.
@@ -503,6 +513,10 @@ impl DrawVector {
         };
         let mut tv = std::mem::take(&mut self.tess_verts);
         let mut ti = std::mem::take(&mut self.tess_indices);
+        // Stated per fill, not per DrawVector: `tessellate_path_fill`'s signature
+        // stays untouched (it has call sites in the map widget that have no fill
+        // rule to pass), and the state is cleared below so it cannot carry over.
+        self.tess.set_fill_rule(self.cur_fill_rule.take());
         tessellate_path_fill(
             &mut self.path,
             &mut self.tess,

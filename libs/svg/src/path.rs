@@ -6,7 +6,7 @@ pub enum Winding {
     CW,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillRule {
     NonZero,
     EvenOdd,
