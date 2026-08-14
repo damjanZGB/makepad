@@ -444,6 +444,27 @@ impl Cx {
                         // for why this defaults to ON.
                         self.draw_pass_to_window(*draw_pass_id, windows_window_vsync(), window, d3d11_cx);
                         presented = true;
+                    } else {
+                        // THE WINDOW IS GONE, so this pass can never be painted — clear
+                        // its dirty flag rather than leaving it set forever.
+                        //
+                        // `paint_dirty` is only ever cleared inside `draw_pass_to_window`
+                        // / `draw_pass_to_texture` (`d3d11.rs`), so a pass whose window
+                        // was closed at runtime (`CxOsOp::CloseWindow`, which removes it
+                        // from `d3d11_windows` but keeps the `CxWindow` slot so it can be
+                        // re-created) stayed dirty for the rest of the process.
+                        //
+                        // That is not a leak, it is a BUSY LOOP: `any_passes_dirty()` is
+                        // what keeps `event_flow` in `EventFlow::Poll` instead of
+                        // sleeping in `GetMessageW`, and Poll is only self-pacing because
+                        // the vsync-blocking `Present` inside this function throttles it.
+                        // With the only dirty pass belonging to a closed window nothing
+                        // presents, nothing blocks, and the loop spins at 100% of a core.
+                        //
+                        // Measured in reStrikeSGX-R, which closes and re-creates its
+                        // overlay window at runtime: 99% of one core with the overlay
+                        // stopped, against ~0% with this line.
+                        self.passes[*draw_pass_id].paint_dirty = false;
                     }
                 }
                 CxDrawPassParent::DrawPass(_) => {
