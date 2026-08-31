@@ -588,7 +588,7 @@ impl Cx {
                         self.windows[window_id].is_created = false;
                         d3d11_windows[index].win32_window.close_window();
                         d3d11_windows.remove(index);
-                        if d3d11_windows.len() == 0 {
+                        if d3d11_windows.len() == 0 && !self.keep_alive_with_no_windows {
                             ret = EventFlow::Exit
                         }
                     }

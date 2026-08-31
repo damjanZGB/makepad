@@ -63,6 +63,15 @@ pub struct Cx {
     pub script_data: CxScriptData,
     pub package_root: Option<String>,
 
+    /// When `true`, closing the last open window does NOT exit the process — the
+    /// platform loop keeps running with zero windows instead of setting
+    /// `EventFlow::Exit`. Off by default, matching every prior Makepad app's
+    /// behaviour. Set this before closing what may become the last window (e.g. a
+    /// "minimize to tray" op) if the app intends to keep running with no windows
+    /// open and recreate one later. Consulted at the exact point a `CloseWindow` op
+    /// would otherwise exit: `os/windows/windows.rs`'s `CxOsOp::CloseWindow` handler.
+    pub keep_alive_with_no_windows: bool,
+
     pub debug_trace_active: bool,
 
     pub(crate) os_type: OsType,
@@ -421,6 +430,7 @@ impl Cx {
 
         Self {
             package_root: None,
+            keep_alive_with_no_windows: false,
             demo_time_repaint: false,
             null_texture,
             null_cube_texture,
