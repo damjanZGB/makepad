@@ -215,7 +215,11 @@ impl Cx {
                 // Exit once the last window is gone, but not while another WindowClosed
                 // is still queued (the app must see every WindowClosed before Shutdown)
                 // or a CreateWindow op is pending (the app is not actually windowless).
+                // ...and not when the app has asked to outlive its windows: a
+                // window-owning app may legitimately want to close every window
+                // and keep running (a tray/overlay app re-creating one later).
                 if d3d11_windows.is_empty()
+                    && !self.keep_alive_with_no_windows
                     && !with_win32_app(|app| {
                         app.pending_events
                             .iter()
