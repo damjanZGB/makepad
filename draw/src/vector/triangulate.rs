@@ -265,7 +265,33 @@ pub fn append_tessellated_geometry_decked(
         acc_verts.push(params.params[2]);
         acc_verts.push(params.params[3]);
         acc_verts.push(deck_v);
-        acc_verts.push(if deck_v > 0.0 {
+        // The deck depth bump applies to SOLID fills only.
+        //
+        // `params[4]`/`params[5]` are a union: their meaning depends on `params[0]`
+        // (the gradient type the shader switches on). For a solid fill, `params[4]`
+        // is the deck height in meters and `params[5]` is a depth the bump belongs
+        // in. For a GRADIENT fill, `params[4]` is the gradient's second endpoint
+        // (y2 for linear, ry for radial -- see `DrawSvg`'s vertex fn, which reads
+        // exactly those slots) and `params[5]` is the gradient's LUT ROW INDEX,
+        // which `DrawVector::end` turns into the texture V coordinate
+        // `(row + 0.5) / row_count`.
+        //
+        // Without this guard, every gradient whose y2 is positive -- i.e. nearly
+        // every real gradient, since y2 is a coordinate, not a flag -- had a
+        // fractional bump added to its ROW INDEX. The sampled V then landed
+        // between two texel centres and linear filtering mixed in the NEIGHBOURING
+        // gradient's row. It is a quiet failure: the shape still draws, still has a
+        // gradient, and is simply the wrong colour.
+        //
+        // Measured 2026-09-06 in reStrikeSGX-R's arcade overlays: a plate specified
+        // `#fff -> #abbcff` rendered as a flat 70/30 blend with the sibling accent
+        // gradient at every sampled pixel (`(0 + 0.30 + 0.5) / 2 = 0.40` instead of
+        // `0.25`). Its sibling was unaffected only by luck -- row 1's bumped V of
+        // 0.90 clamps to the shader's `1.0 - half_v` = 0.75, which is that row's
+        // exact texel centre -- so the bug reads as "one shape is miscoloured",
+        // not as "gradients are broken".
+        let is_gradient = params.params[0] > 0.5;
+        acc_verts.push(if deck_v > 0.0 && !is_gradient {
             params.params[5] + 0.30 * (deck_v / 2.0).min(1.0)
         } else {
             params.params[5]
