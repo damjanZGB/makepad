@@ -2522,6 +2522,7 @@ impl DrawText {
             style: Style {
                 font_family_id: self.text_style.font_family.to_font_family_id(),
                 font_size_in_pts: self.text_style.font_size,
+                letter_spacing_in_ems: self.text_style.letter_spacing,
                 color: None,
             },
             options: LayoutOptions {
@@ -3196,6 +3197,11 @@ pub struct TextStyle {
     pub font_size: f32,
     #[live(1.0)]
     pub line_spacing: f32,
+    /// Extra advance after each glyph, as a fraction of the font size (EMS) --
+    /// the same unit CSS/SVG `letter-spacing: .1em` uses, so a design's tracking
+    /// can be carried over verbatim. 0.0 is the font's own spacing.
+    #[live(0.0)]
+    pub letter_spacing: f32,
     /// A vertical offset applied when drawing text, as a fraction of the font size.
     /// Positive values shift text downward, useful for aligning baselines when
     /// mixing fonts with different vertical metrics (e.g., code font with regular text).

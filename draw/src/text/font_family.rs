@@ -43,12 +43,17 @@ impl FontFamily {
         self.id
     }
 
-    pub fn get_or_shape(&self, text: Substr) -> Rc<ShapedText> {
+    /// `letter_spacing` is in EMS, matching CSS/SVG `letter-spacing` with an `em`
+    /// unit. It was hardcoded to `Ems(0.0)` here, which quietly discarded the one
+    /// thing `ShapeParams` already carried and `Shaper::shape` already applied
+    /// (`shaper.rs`: `glyph.advance_in_ems += letter_spacing`) -- so a design whose
+    /// tracking is load-bearing rendered too narrow, with no error anywhere.
+    pub fn get_or_shape(&self, text: Substr, letter_spacing: Ems) -> Rc<ShapedText> {
         self.shaper.borrow_mut().get_or_shape(ShapeParams {
             text,
             fonts: self.fonts.clone(),
             direction: Direction::default(),
-            letter_spacing: Ems(0.0),
+            letter_spacing,
             word_spacing: Ems(0.0),
             features: Rc::new(Vec::new()),
         })
