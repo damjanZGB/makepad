@@ -10,7 +10,7 @@ use {
         rasterizer::{self, RasterizedGlyph, Rasterizer},
         sdfer,
         selection::{Cursor, CursorPosition, Selection},
-        shaper::{self, ShapedText},
+        shaper::{self, Ems, ShapedText},
         substr::Substr,
     },
     fxhash::FxHashMap,
@@ -426,6 +426,7 @@ impl LayoutContext {
             self.span_text(len),
             self.font_family.clone(),
             self.style.font_size_in_lpxs(),
+            self.style.letter_spacing_in_ems,
             SegmentKind::Word,
         );
         while !fitter.is_empty() {
@@ -468,6 +469,7 @@ impl LayoutContext {
             self.span_text(len),
             self.font_family.clone(),
             self.style.font_size_in_lpxs(),
+            self.style.letter_spacing_in_ems,
             SegmentKind::Grapheme,
         );
         while !fitter.is_empty() {
@@ -492,6 +494,7 @@ impl LayoutContext {
             &self.font_family.get_or_shape(
                 self.text
                     .substr(self.current_row_end..self.current_row_end + len),
+                Ems(self.style.letter_spacing_in_ems),
             ),
         );
     }
@@ -652,7 +655,9 @@ impl LayoutContext {
 
     /// Truncates the last row to fit within `max_width` and appends an ellipsis glyph.
     fn truncate_last_row_with_ellipsis(&mut self, max_width: f32) {
-        let ellipsis_shaped = self.font_family.get_or_shape("…".into());
+        let ellipsis_shaped = self
+            .font_family
+            .get_or_shape("…".into(), Ems(self.style.letter_spacing_in_ems));
         let font_size_in_lpxs = self.style.font_size_in_lpxs();
         let ellipsis_width: f32 = ellipsis_shaped
             .glyphs
@@ -715,6 +720,7 @@ struct Fitter {
     text: Substr,
     font_family: Rc<FontFamily>,
     font_size_in_lpxs: f32,
+    letter_spacing_in_ems: f32,
     lens: Vec<usize>,
     widths_in_lpxs: Vec<f32>,
 }
@@ -724,6 +730,7 @@ impl Fitter {
         text: Substr,
         font_family: Rc<FontFamily>,
         font_size_in_lpxs: f32,
+        letter_spacing_in_ems: f32,
         segment_kind: SegmentKind,
     ) -> Self {
         let mut lens: Vec<_> = match segment_kind {
@@ -742,7 +749,8 @@ impl Fitter {
             .scan(0, |state, len| {
                 let start = *state;
                 let end = start + len;
-                let segment = font_family.get_or_shape(text.substr(start..end));
+                let segment =
+                    font_family.get_or_shape(text.substr(start..end), Ems(letter_spacing_in_ems));
                 let width_in_lpxs = segment.width_in_ems * font_size_in_lpxs;
                 *state = end;
                 Some(width_in_lpxs)
@@ -751,6 +759,7 @@ impl Fitter {
         Self {
             text,
             font_family,
+            letter_spacing_in_ems,
             font_size_in_lpxs,
             lens,
             widths_in_lpxs,
@@ -781,7 +790,9 @@ impl Fitter {
         if let Some(mut best_count) = best_count {
             while best_count > 0 {
                 let best_len = self.lens[..best_count].iter().sum();
-                let best_text = self.font_family.get_or_shape(self.text.substr(0..best_len));
+                let best_text = self
+                    .font_family
+                    .get_or_shape(self.text.substr(0..best_len), Ems(self.letter_spacing_in_ems));
                 if best_text.width_in_ems * self.font_size_in_lpxs <= wrap_width_in_lpxs {
                     self.lens.drain(..best_count);
                     self.widths_in_lpxs.drain(..best_count);
@@ -1008,6 +1019,10 @@ impl<'a> LayoutParams for BorrowedLayoutParams<'a> {
 pub struct Style {
     pub font_family_id: FontFamilyId,
     pub font_size_in_pts: f32,
+    /// Extra advance added after each glyph, in EMS -- CSS/SVG `letter-spacing`.
+    /// Part of `Style` because `Style` is the layout cache key: two runs that
+    /// differ only in tracking are different layouts and must not share an entry.
+    pub letter_spacing_in_ems: f32,
     pub color: Option<Color>,
 }
 
@@ -1026,6 +1041,7 @@ impl Hash for Style {
     {
         self.font_family_id.hash(hasher);
         self.font_size_in_pts.to_bits().hash(hasher);
+        self.letter_spacing_in_ems.to_bits().hash(hasher);
         self.color.hash(hasher);
     }
 }
@@ -1036,6 +1052,9 @@ impl PartialEq for Style {
             return false;
         }
         if self.font_size_in_lpxs().to_bits() != other.font_size_in_lpxs().to_bits() {
+            return false;
+        }
+        if self.letter_spacing_in_ems.to_bits() != other.letter_spacing_in_ems.to_bits() {
             return false;
         }
         if self.color != other.color {
@@ -1516,6 +1535,7 @@ mod tests {
             style: Style {
                 font_family_id: 0u64.into(),
                 font_size_in_pts: 12.0,
+                letter_spacing_in_ems: 0.0,
                 color: None,
             },
             options: LayoutOptions::default(),
@@ -1737,6 +1757,7 @@ mod tests {
             style: Style {
                 font_family_id: FAMILY.into(),
                 font_size_in_pts: 12.0,
+                letter_spacing_in_ems: 0.0,
                 color: None,
             },
             options: LayoutOptions::default(),
@@ -1824,6 +1845,7 @@ mod tests {
             style: super::Style {
                 font_family_id: family.into(),
                 font_size_in_pts: 12.0,
+                letter_spacing_in_ems: 0.0,
                 color: None,
             },
             options: LayoutOptions {

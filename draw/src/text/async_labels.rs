@@ -47,6 +47,10 @@ struct Key {
     dpi: u32,
     scale: u32,
     spacing: u32,
+    /// Letter-spacing (ems) bits. Part of the key because it changes the
+    /// shaped advances, so two labels differing only in it are NOT the
+    /// same publication.
+    letter_spacing: u32,
 }
 impl std::hash::Hash for Key {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -214,6 +218,7 @@ impl LabelCache {
             dpi: (dpi as f32).to_bits(),
             scale: draw.font_scale.to_bits(),
             spacing: draw.text_style.line_spacing.to_bits(),
+            letter_spacing: draw.text_style.letter_spacing.to_bits(),
         }
     }
 
@@ -489,6 +494,7 @@ fn prepare(
         style: Style {
             font_family_id: key.family,
             font_size_in_pts: f32::from_bits(key.size),
+            letter_spacing_in_ems: f32::from_bits(key.letter_spacing),
             color: None,
         },
         options: LayoutOptions {
@@ -565,6 +571,7 @@ mod tests {
             dpi: 2.0_f32.to_bits(),
             scale: 1.0_f32.to_bits(),
             spacing: 1.0_f32.to_bits(),
+            letter_spacing: 0.0_f32.to_bits(),
         };
         cache.start(&mut cx);
         cache.waiting.insert(key.clone());

@@ -190,7 +190,7 @@ pub struct FontDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{FontDefinition, FontFamilyDefinition, Loader};
+    use super::{super::shaper::Ems, FontDefinition, FontFamilyDefinition, Loader};
     use crate::{
         makepad_platform::{Cx, SharedBytes},
         text::{font::FontId, font_family::FontDiagnostics, layouter},
@@ -265,7 +265,7 @@ mod tests {
             loader.font_family_cache.len(),
         );
         let queued_http_before = cx.script_data.resources.http_resources.len();
-        let shaped = family.get_or_shape("\u{10FFFF}".into());
+        let shaped = family.get_or_shape("\u{10FFFF}".into(), Ems(0.0));
 
         assert!(shaped.glyphs.iter().any(|glyph| glyph.id == 0));
         assert_eq!(
@@ -324,7 +324,7 @@ mod tests {
 
         let shaped = loader
             .get_or_load_font_family_rc(family_id)
-            .get_or_shape("⌘".into());
+            .get_or_shape("⌘".into(), Ems(0.0));
         assert!(shaped.glyphs.iter().all(|glyph| glyph.id != 0));
         assert!(shaped
             .glyphs
