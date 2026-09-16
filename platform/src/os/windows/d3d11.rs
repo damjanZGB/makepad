@@ -1428,7 +1428,37 @@ impl Cx {
         let Some(context) = self.os.d3d11_context.clone() else {
             return false;
         };
+
+        // TAKE THE KEYED MUTEX AROUND THE COPY.
+        //
+        // `update_shared_texture` creates this texture with
+        // D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, and D3D11 requires every device touching
+        // such a resource to hold the mutex first. A `CopyResource` into it without the
+        // mutex is not an error anybody is told about: the call returns, the copy never
+        // lands, and the consumer opens a perfectly valid texture that is permanently empty. Observed
+        // exactly that way -- reStrikeOBS opened the resource by name, acquired key 0,
+        // drew, and got nothing, while the producer's own logs said the copy had run.
+        //
+        // Key 0 and a 2000 ms wait, which is what every other keyed-mutex site in this
+        // file already uses -- `Cx::shared_texture_keyed_acquire` (:1113) and the readback
+        // in `debug_readback_shared_texture` (:1336) -- so all three agree on the
+        // handshake. The vtable calls are this file's own convention for IDXGIKeyedMutex:
+        // the stripped windows bindings only expose the `_Impl` side of the interface.
+        let keyed_mutex = self.textures[dst.texture_id()].os.keyed_mutex.clone();
+        if let Some(km) = &keyed_mutex {
+            let hr = unsafe { (Interface::vtable(km).AcquireSync)(Interface::as_raw(km), 0, 2000) };
+            if hr.is_err() {
+                // The consumer is mid-read, or died holding it. Skipping one frame is
+                // right; writing without the mutex would be dropped anyway.
+                return false;
+            }
+        }
         unsafe { context.CopyResource(&dst_res, &src_res) };
+        if let Some(km) = &keyed_mutex {
+            unsafe {
+                let _ = (Interface::vtable(km).ReleaseSync)(Interface::as_raw(km), 0);
+            }
+        }
         true
     }
 
