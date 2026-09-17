@@ -16,6 +16,7 @@ use {
     crate::cx::Cx,
     crate::file_dialogs::{FileDialog, FileDialogAction},
     std::ffi::c_void,
+    std::os::windows::ffi::OsStringExt,
     std::path::PathBuf,
 };
 
@@ -175,10 +176,13 @@ const CLSCTX_INPROC_SERVER: u32 = 0x1;
 /// Opens the native file picker on its own STA thread and posts the answer
 /// as a [`FileDialogAction`].
 pub fn open_select_file_dialog(settings: FileDialog) {
-    std::thread::Builder::new()
+    let id = settings.id;
+    // `Cx::post_action` is a free function backed by a global channel — unlike the
+    // closure below, it needs nothing moved into it, so the failure branch can answer
+    // directly instead of needing the closure back.
+    if let Err(error) = std::thread::Builder::new()
         .name("file-dialog".into())
         .spawn(move || {
-            let id = settings.id;
             let picked = unsafe { with_com(|| run_open_dialog(&settings, false)) };
             Cx::post_action(if picked.is_empty() {
                 FileDialogAction::FileCancelled { id }
@@ -186,28 +190,36 @@ pub fn open_select_file_dialog(settings: FileDialog) {
                 FileDialogAction::FileSelected { id, paths: picked }
             });
         })
-        .ok();
+    {
+        // The caller armed this dialog and is waiting for an answer; without this, a
+        // thread that never started leaves it waiting forever instead of cancelled.
+        crate::error!("file dialog: could not start its thread: {error}");
+        Cx::post_action(FileDialogAction::FileCancelled { id });
+    }
 }
 
 /// Opens the native save panel on its own STA thread. The dialog itself
 /// runs the "already exists, replace?" prompt.
 pub fn open_save_file_dialog(settings: FileDialog) {
-    std::thread::Builder::new()
+    let id = settings.id;
+    if let Err(error) = std::thread::Builder::new()
         .name("save-dialog".into())
         .spawn(move || {
-            let id = settings.id;
             let picked = unsafe { with_com(|| run_save_dialog(&settings)) };
             Cx::post_action(match picked {
                 Some(path) => FileDialogAction::SaveFileSelected { id, path },
                 None => FileDialogAction::SaveFileCancelled { id },
             });
         })
-        .ok();
+    {
+        crate::error!("save dialog: could not start its thread: {error}");
+        Cx::post_action(FileDialogAction::SaveFileCancelled { id });
+    }
 }
 
 /// "Save into this folder": the folder picker with directory creation on.
 pub fn open_save_folder_dialog(settings: FileDialog) {
-    std::thread::Builder::new()
+    if let Err(error) = std::thread::Builder::new()
         .name("folder-dialog".into())
         .spawn(move || {
             let picked = unsafe { with_com(|| run_open_dialog(&settings, true)) };
@@ -216,7 +228,10 @@ pub fn open_save_folder_dialog(settings: FileDialog) {
                 None => FileDialogAction::FolderCancelled,
             });
         })
-        .ok();
+    {
+        crate::error!("folder dialog: could not start its thread: {error}");
+        Cx::post_action(FileDialogAction::FolderCancelled);
+    }
 }
 
 /// Wrap a dialog run in this thread's COM apartment.
@@ -279,7 +294,11 @@ unsafe fn shell_item_path(item: *mut c_void) -> Option<PathBuf> {
         while *raw.add(len) != 0 {
             len += 1;
         }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(raw, len));
+        // `from_utf16_lossy` would replace an unpaired surrogate with U+FFFD — silent
+        // path corruption on a filesystem name Windows itself considers valid.
+        // `OsString::from_wide` keeps it exactly (Rust's `OsString` is WTF-8 on
+        // Windows, which represents an unpaired surrogate losslessly).
+        let text = std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len));
         CoTaskMemFree(raw as *mut c_void);
         Some(PathBuf::from(text))
     } else {
@@ -443,7 +462,7 @@ unsafe fn run_save_dialog(settings: &FileDialog) -> Option<PathBuf> {
 /// Opens the native folder picker on its own STA thread and posts the
 /// answer as a [`FileDialogAction`].
 pub fn open_select_folder_dialog(settings: FileDialog) {
-    std::thread::Builder::new()
+    if let Err(error) = std::thread::Builder::new()
         .name("folder-dialog".into())
         .spawn(move || {
             let picked = unsafe { with_com(|| run_open_dialog(&settings, true)) };
@@ -452,5 +471,8 @@ pub fn open_select_folder_dialog(settings: FileDialog) {
                 None => FileDialogAction::FolderCancelled,
             });
         })
-        .ok();
+    {
+        crate::error!("folder dialog: could not start its thread: {error}");
+        Cx::post_action(FileDialogAction::FolderCancelled);
+    }
 }
