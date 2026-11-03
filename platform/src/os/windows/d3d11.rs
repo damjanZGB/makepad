@@ -2502,13 +2502,16 @@ impl CxOsTexture {
     /// Forgets every GPU object and every "already uploaded" record for this texture, so the
     /// ordinary upload path rebuilds it from the CPU-side pixels the next time it is drawn.
     ///
-    /// The shared handle and keyed mutex are cleared rather than closed: the handle is duped
-    /// out to other processes by `share_texture_for_presentable_image`, so this type has never
-    /// owned its lifetime and closing it here would break an unrelated feature.
+    /// The shared NT handle is CLOSED, not just cleared. An earlier comment here said it was
+    /// "duped out to other processes" and so not this type's to close; that was the old
+    /// handle-passing protocol. Sharing is by NAME now (`update_shared_texture` registers
+    /// `shared_texture_name(id)`, the peer opens it with `OpenSharedResourceByName`), so this
+    /// handle exists only to keep the named object alive while the texture does -- and a
+    /// device loss ends that. Clearing it without closing leaked one handle per loss.
     fn forget_gpu_objects(&mut self) {
         self.texture = None;
         self.keyed_mutex = None;
-        self.shared_handle = HANDLE(std::ptr::null_mut());
+        self.close_shared_handle();
         self.shader_resource_view = None;
         self.render_target_view = None;
         self.render_target_face_views = Default::default();
@@ -3022,6 +3025,28 @@ impl D3d11Buffer {
             len_slots,
             padded.as_ptr() as *const _,
         );
+    }
+}
+
+impl CxOsTexture {
+    /// Close the NT handle `update_shared_texture` keeps open, if any, and clear it.
+    fn close_shared_handle(&mut self) {
+        if !self.shared_handle.0.is_null() {
+            unsafe {
+                let _ = CloseHandle(self.shared_handle);
+            }
+        }
+        self.shared_handle = HANDLE(std::ptr::null_mut());
+    }
+}
+
+/// The shared NT handle is OWNED by the texture: `IDXGIResource1::CreateSharedHandle`'s
+/// doc says to `CloseHandle` it "in order to avoid memory leaks", and nothing else closes
+/// it. Without this every re-created shared texture -- reStrikeSGX-R makes one per overlay
+/// Start -- leaked a handle and kept its named object alive.
+impl Drop for CxOsTexture {
+    fn drop(&mut self) {
+        self.close_shared_handle();
     }
 }
 
@@ -3674,6 +3699,9 @@ impl CxTexture {
             };
             let mut name_wide: Vec<u16> = shared_texture_name(id_u64).encode_utf16().collect();
             name_wide.push(0);
+            // A re-share replaces the texture; its old handle would otherwise leak AND keep
+            // the name registered, so the CreateSharedHandle below could not take it.
+            self.os.close_shared_handle();
             let mut handle = HANDLE(std::ptr::null_mut());
             match resource.cast::<IDXGIResource1>() {
                 Ok(dxgi_resource1) => {
@@ -4679,6 +4707,53 @@ impl CxOsDrawShader {
             custom_uniform_buffer_ids,
             scope_uniform_buffer_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod shared_handle_tests {
+    use super::CxOsTexture;
+    use crate::windows::Win32::Foundation::HANDLE;
+    use std::os::windows::io::{BorrowedHandle, IntoRawHandle, RawHandle};
+
+    /// A real kernel handle owned by nobody but the test: a temporary file's.
+    fn kernel_handle(tag: &str) -> RawHandle {
+        let path = std::env::temp_dir().join(format!("makepad-shared-handle-{tag}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        file.into_raw_handle()
+    }
+
+    /// Whether `raw` still names an open handle: duplicating a closed one fails.
+    fn handle_is_open(raw: RawHandle) -> bool {
+        unsafe { BorrowedHandle::borrow_raw(raw) }.try_clone_to_owned().is_ok()
+    }
+
+    /// `update_shared_texture` keeps the NT handle from `CreateSharedHandle` open in
+    /// `shared_handle` so the NAMED object stays findable while the texture lives. When
+    /// the texture goes, the handle must go with it: Microsoft's own
+    /// `IDXGIResource1::CreateSharedHandle` doc says to `CloseHandle` it "in order to
+    /// avoid memory leaks". Before this, every overlay Start/Stop in reStrikeSGX-R
+    /// (a fresh shared texture per attach) leaked one handle and its named object.
+    /// Any kernel handle shows the ownership; a GPU is not needed for that.
+    #[test]
+    fn dropping_a_texture_closes_its_shared_handle() {
+        let raw = kernel_handle("drop");
+        assert!(handle_is_open(raw));
+        let mut texture = CxOsTexture::default();
+        texture.shared_handle = HANDLE(raw as _);
+        drop(texture);
+        assert!(!handle_is_open(raw), "the texture's shared handle must be closed with it");
+    }
+
+    #[test]
+    fn forgetting_gpu_objects_closes_the_shared_handle_too() {
+        let raw = kernel_handle("forget");
+        let mut texture = CxOsTexture::default();
+        texture.shared_handle = HANDLE(raw as _);
+        texture.forget_gpu_objects();
+        assert!(texture.shared_handle.0.is_null());
+        assert!(!handle_is_open(raw), "a device loss must not leak the old handle");
     }
 }
 
