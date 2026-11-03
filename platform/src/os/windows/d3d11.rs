@@ -156,6 +156,18 @@ impl Cx {
                 .completed
                 .load(std::sync::atomic::Ordering::Acquire),
         );
+        // LOCAL FIX (reStrikeSGX-R): drain a release backlog, as upstream's
+        // OpenGL backend does -- one 64-record sweep a frame falls behind any
+        // frame that releases more. See `collect_backlog`.
+        self.draw_lists.1.allocations.collect_backlog(
+            self.repaint_id,
+            self.textures
+                .1
+                .serials
+                .completed
+                .load(std::sync::atomic::Ordering::Acquire),
+            8,
+        );
         let _phase = crate::thread::ui_hang::ui_phase_detail(
             crate::thread::UiPhase::DrawList,
             draw_list_id.index() as u32,
@@ -312,12 +324,34 @@ impl Cx {
                         } else {
                             draw_item.os.inst_vbuf.last_size * 4
                         };
-                        let Some(charge) = upload_budget.allocations.reserve(capacity) else {
-                            draw_item.instance_upload_pending = true;
-                            self.demo_time_repaint = true;
-                            continue;
-                        };
-                        draw_item.os.inst_vbuf.charge = Some(charge);
+                        // LOCAL FIX (reStrikeSGX-R): book a charge only when this upload
+                        // allocates GPU memory. The conditions mirror the two upload
+                        // paths below: `update_with_f32_vertex_data` recreates the buffer
+                        // only on a size change, `update_retained_instances` only when it
+                        // must grow. Booking on EVERY upload left one released record per
+                        // draw item per frame; an animating window outran `collect`, the
+                        // ledger reached the device envelope, and from then on `reserve`
+                        // refused everything and this loop skipped every draw call -- both
+                        // windows presented empty frames, nothing logged. Measured: ~8 MB/s
+                        // of phantom bookings, blank after 8-25 minutes.
+                        let reallocates = draw_item.os.inst_vbuf.buffer.is_none()
+                            || if draw_item.retained_instances.is_none() {
+                                draw_item.os.inst_vbuf.last_size != slots
+                            } else {
+                                slots > draw_item.os.inst_vbuf.last_size
+                            };
+                        if crate::retained_instances::instance_upload_needs_charge(
+                            draw_item.os.inst_vbuf.charge.as_ref().map(|c| c.bytes()),
+                            reallocates,
+                            capacity,
+                        ) {
+                            let Some(charge) = upload_budget.allocations.reserve(capacity) else {
+                                draw_item.instance_upload_pending = true;
+                                self.demo_time_repaint = true;
+                                continue;
+                            };
+                            draw_item.os.inst_vbuf.charge = Some(charge);
+                        }
                     }
                     draw_item.instance_upload_pending = false;
                     draw_call.instance_dirty = false;

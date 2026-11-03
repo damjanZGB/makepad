@@ -122,6 +122,7 @@ pub struct RetainedAllocationBudget {
     metadata_disposals: Vec<Arc<RetainedAllocationRecord>>,
     collect_cursor: usize,
     collected_frame: Option<u64>,
+    collected_backlog_frame: Option<u64>,
     refusals: usize,
     cache_pressure: std::cell::Cell<bool>,
     pending_backend_retirements: usize,
@@ -160,6 +161,23 @@ impl RetainedAllocation {
     pub fn unique_owner(&self) -> bool {
         self.0.owners.load(Ordering::Acquire) == 1
     }
+    /// The bytes this charge books against the ledger.
+    pub fn bytes(&self) -> usize {
+        self.0.bytes
+    }
+}
+
+/// Whether an instance upload must book a NEW ledger charge.
+///
+/// Only when the backend allocates GPU memory for it: the buffer is created or
+/// reallocated (`reallocates`), nothing is booked yet, or the existing charge no
+/// longer covers `capacity`. A re-upload into the same buffer keeps the charge
+/// it already holds. Booking one per upload regardless left one released record
+/// per draw item per frame for `collect`, which frees 64 a frame, so an
+/// animating UI grew the ledger without bound until `reserve` refused every
+/// upload and every draw call was skipped.
+pub fn instance_upload_needs_charge(existing: Option<usize>, reallocates: bool, capacity: usize) -> bool {
+    reallocates || existing.map_or(true, |bytes| bytes < capacity)
 }
 
 /// Retained storage gets a share of the device working set, independently of
@@ -259,6 +277,7 @@ impl RetainedAllocationBudget {
             metadata_disposals: Vec::with_capacity(4096),
             collect_cursor: 0,
             collected_frame: None,
+            collected_backlog_frame: None,
             refusals: 0,
             cache_pressure: std::cell::Cell::new(false),
             pending_backend_retirements: 0,
@@ -361,6 +380,24 @@ impl RetainedAllocationBudget {
             } else {
                 self.collect_cursor += 1;
             }
+        }
+    }
+    /// Extra bounded sweeps while released records are queued. Every upload of
+    /// a draw item's instances can leave one released record behind and a
+    /// redraw can re-upload hundreds of items per frame, so one 64-record sweep
+    /// per frame lets the backlog outlast the interaction. Each call stays within
+    /// `collect`'s bound; `max_calls` caps the frame's total. Ported from
+    /// upstream makepad 56bb530b96, which called it from OpenGL only.
+    pub fn collect_backlog(&mut self, frame: u64, completed: u64, max_calls: usize) {
+        if self.collected_backlog_frame == Some(frame) {
+            return;
+        }
+        self.collected_backlog_frame = Some(frame);
+        for _ in 0..max_calls {
+            if self.released.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            self.collect(completed);
         }
     }
     pub fn collect_for_frame(&mut self, frame: u64, completed: u64) {
@@ -664,6 +701,56 @@ impl RetainedInstancePool {
 #[cfg(test)]
 mod upload_tests {
     use super::*;
+
+    /// A re-upload into the SAME GPU buffer must not book a new ledger record.
+    /// The D3D11 backend booked one per instance upload whether or not the
+    /// buffer was reallocated, `collect` frees 64 a frame, and a UI animating a
+    /// few hundred draw items a frame booked far more than that: the ledger
+    /// climbed ~8 MB/s with no memory behind it, reached the 4.6 GB device
+    /// envelope after ~12 minutes, and from then on every `reserve` was
+    /// refused, every draw call skipped, and both windows presented empty
+    /// frames with nothing logged (measured in reStrikeSGX-R, 2026-11-03).
+    #[test]
+    fn a_same_size_reupload_keeps_its_charge_and_the_ledger_stays_flat() {
+        assert!(instance_upload_needs_charge(None, false, 256), "nothing booked yet");
+        assert!(instance_upload_needs_charge(Some(256), true, 256), "a reallocated buffer is new memory");
+        assert!(instance_upload_needs_charge(Some(128), false, 256), "the charge no longer covers the upload");
+        assert!(!instance_upload_needs_charge(Some(256), false, 256));
+        assert!(!instance_upload_needs_charge(Some(512), false, 256));
+
+        // 300 draw items re-uploaded every frame -- a redraw of an animating
+        // window -- against `collect`'s 64 records a frame.
+        const ITEMS: usize = 300;
+        let mut ledger = RetainedAllocationBudget::new(1 << 30);
+        let mut charges: Vec<Option<RetainedAllocation>> = (0..ITEMS).map(|_| None).collect();
+        for frame in 1..=1_000u64 {
+            for charge in charges.iter_mut() {
+                let reallocates = charge.is_none();
+                if instance_upload_needs_charge(charge.as_ref().map(RetainedAllocation::bytes), reallocates, 256) {
+                    *charge = Some(ledger.reserve(256).expect("a flat ledger never refuses"));
+                }
+                charge.as_ref().unwrap().submitted(frame);
+            }
+            ledger.collect_for_frame(frame, frame - 1);
+        }
+        assert_eq!(ledger.record_count(), ITEMS, "one record per live buffer");
+        assert_eq!(ledger.bytes(), ITEMS * 256);
+        assert_eq!(ledger.refusals(), 0);
+    }
+
+    /// Ported from upstream makepad (56bb530b96, `collect_backlog`): one
+    /// 64-record sweep a frame cannot keep up with a frame that releases more.
+    #[test]
+    fn a_released_backlog_drains_in_one_frame() {
+        let mut ledger = RetainedAllocationBudget::new(1 << 30);
+        let charges: Vec<_> = (0..500).map(|_| ledger.reserve(64).unwrap()).collect();
+        drop(charges);
+        ledger.collect_for_frame(1, 0);
+        assert_eq!(ledger.record_count(), 436, "one sweep frees 64");
+        ledger.collect_backlog(1, 0, 8);
+        assert_eq!(ledger.record_count(), 0);
+        assert_eq!(ledger.bytes(), 0);
+    }
 
     #[test]
     fn machine_residency_pressure_has_fractional_hysteresis() {
