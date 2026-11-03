@@ -1478,12 +1478,30 @@ impl Cx {
         // in `debug_readback_shared_texture` (:1336) -- so all three agree on the
         // handshake. The vtable calls are this file's own convention for IDXGIKeyedMutex:
         // the stripped windows bindings only expose the `_Impl` side of the interface.
+        //
+        // But NOT the 2000 ms wait those other sites use, and NOT `hr.is_err()` as the
+        // test. This call runs on the UI thread once per frame, so a consumer holding the
+        // mutex for a long time (a stalled graphics thread, a debugger) blocked the whole
+        // app -- every window, input included -- for up to two seconds PER FRAME. And a
+        // timeout is not an error: `AcquireSync` returns `WAIT_TIMEOUT` (0x102), a SUCCESS
+        // code, so the old test went on to copy WITHOUT the mutex (the write D3D11 drops)
+        // and then `ReleaseSync` a mutex this device did not own. `WAIT_ABANDONED` (0x80)
+        // is a success code too and does not grant ownership either. Only `S_OK` does.
+        //
+        // The consumer it pairs with, reStrikeOBS's `sgx_texture_source.cpp`, waits at
+        // most 8 ms for the same key and holds it only for one draw; a few ms here is
+        // generous for that, and a frame skipped while it holds the key is the right
+        // trade -- the consumer keeps drawing the last frame that did land.
         let keyed_mutex = self.textures[dst.texture_id()].os.keyed_mutex.clone();
         if let Some(km) = &keyed_mutex {
-            let hr = unsafe { (Interface::vtable(km).AcquireSync)(Interface::as_raw(km), 0, 2000) };
-            if hr.is_err() {
-                // The consumer is mid-read, or died holding it. Skipping one frame is
-                // right; writing without the mutex would be dropped anyway.
+            let hr = unsafe {
+                (Interface::vtable(km).AcquireSync)(
+                    Interface::as_raw(km),
+                    0,
+                    SHARED_COPY_ACQUIRE_TIMEOUT_MS,
+                )
+            };
+            if !shared_copy_acquired(hr.0) {
                 return false;
             }
         }
@@ -1879,6 +1897,19 @@ const DXGI_ERROR_DEVICE_RESET: windows_core::HRESULT = windows_core::HRESULT(0x8
 /// code fired a `Present(1)` + DO_NOT_WAIT into a 33 ms churn instead), but
 /// re-probe now and then so a transient DWM stall cannot freeze the window.
 const LATENCY_TIMEOUT_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long `copy_texture_to_shared` waits for a consumer to release the shared
+/// texture's keyed mutex before skipping the frame. It runs on the UI thread every
+/// frame, so this bounds how long a stalled consumer can freeze the app per frame --
+/// the old 2000 ms froze it outright. See the call site for the reasoning.
+const SHARED_COPY_ACQUIRE_TIMEOUT_MS: u32 = 4;
+
+/// Whether an `IDXGIKeyedMutex::AcquireSync` result grants ownership. Only `S_OK`
+/// does: `WAIT_TIMEOUT` (0x102) and `WAIT_ABANDONED` (0x80) are SUCCESS codes that
+/// `HRESULT::is_err` lets through, and neither leaves the mutex held by this device.
+fn shared_copy_acquired(hr: i32) -> bool {
+    hr == 0
+}
 
 /// Fallback display period used until DXGI frame statistics report a real one.
 const DEFAULT_REFRESH_PERIOD: f64 = 1.0 / 60.0;
@@ -4707,6 +4738,28 @@ impl CxOsDrawShader {
             custom_uniform_buffer_ids,
             scope_uniform_buffer_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod shared_copy_acquire_tests {
+    use super::{shared_copy_acquired, SHARED_COPY_ACQUIRE_TIMEOUT_MS};
+
+    /// A timeout and an abandoned mutex are success HRESULTs; treating them as owned is
+    /// what made the copy run without the mutex and then release one it never took.
+    #[test]
+    fn only_s_ok_grants_the_keyed_mutex() {
+        assert!(shared_copy_acquired(0));
+        assert!(!shared_copy_acquired(0x102), "WAIT_TIMEOUT");
+        assert!(!shared_copy_acquired(0x80), "WAIT_ABANDONED");
+        assert!(!shared_copy_acquired(0x8000_4005u32 as i32), "E_FAIL");
+    }
+
+    /// The wait runs on the UI thread once per frame: it must stay well under one
+    /// 60 Hz frame, never the 2000 ms it used to be.
+    #[test]
+    fn the_copy_never_waits_a_frame_for_the_consumer() {
+        assert!(SHARED_COPY_ACQUIRE_TIMEOUT_MS < 16);
     }
 }
 
